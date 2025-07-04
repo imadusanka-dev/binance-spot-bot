@@ -710,7 +710,7 @@ def main():
         api_secret=API_SECRET,
         telegram_token=TELEGRAM_TOKEN,
         telegram_chat_id=TELEGRAM_CHAT_ID,
-        testnet=True  # IMPORTANT: Set to False only when you're ready for live trading
+        testnet=False  # IMPORTANT: Set to False only when you're ready for live trading
     )
     
     # Start the bot
