@@ -10,6 +10,7 @@ import os
 import requests
 from typing import Dict, Tuple, Optional
 from dotenv import load_dotenv
+import talib
 
 # Load environment variables from .env file
 load_dotenv()
@@ -166,6 +167,8 @@ class BinanceEMABot:
         self.ema_long = 20
         self.last_signal = None
         self.position = 'NONE'  # 'BTC', 'USDT', or 'NONE'
+        self.last_crossover_time = None
+        self.min_trade_amount = 11.0  # Minimum trade amount in USDT
         
         # Initialize Telegram notifier
         self.telegram = None
@@ -188,12 +191,12 @@ class BinanceEMABot:
                 self.telegram.send_error_notification("API Connection", str(e))
             raise
 
-    def get_historical_data(self, limit: int = 100) -> pd.DataFrame:
+    def get_historical_data(self, limit: int = 500) -> pd.DataFrame:
         """
         Get historical kline data from Binance
         
         Args:
-            limit: Number of data points to retrieve
+            limit: Number of data points to retrieve (increased for better EMA calculation)
             
         Returns:
             DataFrame with OHLCV data
@@ -228,9 +231,10 @@ class BinanceEMABot:
                 self.telegram.send_error_notification("Data Fetch Error", str(e))
             raise
 
-    def calculate_ema(self, data: pd.Series, period: int) -> pd.Series:
+    def calculate_ema_tradingview_style(self, data: pd.Series, period: int) -> pd.Series:
         """
-        Calculate Exponential Moving Average
+        Calculate EMA using TradingView-style calculation
+        This matches TradingView's EMA calculation more closely
         
         Args:
             data: Price data series
@@ -239,11 +243,19 @@ class BinanceEMABot:
         Returns:
             EMA series
         """
-        return data.ewm(span=period, adjust=False).mean()
+        try:
+            # Use TA-Lib if available (more accurate)
+            import talib
+            return pd.Series(talib.EMA(data.values, timeperiod=period), index=data.index)
+        except ImportError:
+            # Fallback to pandas with TradingView-style calculation
+            alpha = 2 / (period + 1)
+            ema = data.ewm(alpha=alpha, adjust=False).mean()
+            return ema
 
     def generate_signals(self, df: pd.DataFrame) -> Tuple[str, Dict]:
         """
-        Generate trading signals based on EMA crossover
+        Generate trading signals based on EMA crossover with improved logic
         
         Args:
             df: DataFrame with price data
@@ -252,31 +264,67 @@ class BinanceEMABot:
             Tuple of (signal, signal_data)
         """
         # Calculate EMAs
-        df['ema_9'] = self.calculate_ema(df['close'], self.ema_short)
-        df['ema_20'] = self.calculate_ema(df['close'], self.ema_long)
+        df['ema_9'] = self.calculate_ema_tradingview_style(df['close'], self.ema_short)
+        df['ema_20'] = self.calculate_ema_tradingview_style(df['close'], self.ema_long)
         
-        # Get the latest values
+        # Get the latest values (need at least 3 points for crossover detection)
         current_ema_9 = df['ema_9'].iloc[-1]
         current_ema_20 = df['ema_20'].iloc[-1]
         prev_ema_9 = df['ema_9'].iloc[-2]
         prev_ema_20 = df['ema_20'].iloc[-2]
+        prev2_ema_9 = df['ema_9'].iloc[-3]
+        prev2_ema_20 = df['ema_20'].iloc[-3]
         
         current_price = df['close'].iloc[-1]
+        current_timestamp = df['timestamp'].iloc[-1]
         
         signal_data = {
-            'timestamp': df['timestamp'].iloc[-1],
+            'timestamp': current_timestamp,
             'price': current_price,
             'ema_9': current_ema_9,
             'ema_20': current_ema_20,
             'prev_ema_9': prev_ema_9,
-            'prev_ema_20': prev_ema_20
+            'prev_ema_20': prev_ema_20,
+            'ema_diff': current_ema_9 - current_ema_20,
+            'prev_ema_diff': prev_ema_9 - prev_ema_20
         }
         
+        # Improved crossover detection with multiple confirmation points
+        # Bullish crossover: EMA9 crosses above EMA20
+        bullish_cross = (
+            prev2_ema_9 <= prev2_ema_20 and
+            prev_ema_9 <= prev_ema_20 and
+            current_ema_9 > current_ema_20
+        ) or (
+            prev_ema_9 <= prev_ema_20 and
+            current_ema_9 > current_ema_20 and
+            abs(current_ema_9 - current_ema_20) > abs(prev_ema_9 - prev_ema_20)
+        )
+        
+        # Bearish crossover: EMA9 crosses below EMA20
+        bearish_cross = (
+            prev2_ema_9 >= prev2_ema_20 and
+            prev_ema_9 >= prev_ema_20 and
+            current_ema_9 < current_ema_20
+        ) or (
+            prev_ema_9 >= prev_ema_20 and
+            current_ema_9 < current_ema_20 and
+            abs(current_ema_9 - current_ema_20) > abs(prev_ema_9 - prev_ema_20)
+        )
+        
+        # Avoid duplicate signals by checking time since last crossover
+        if self.last_crossover_time:
+            time_diff = current_timestamp - self.last_crossover_time
+            if time_diff < timedelta(hours=2):  # Minimum 2 hours between signals
+                return 'HOLD', signal_data
+        
         # Determine signal
-        if prev_ema_9 <= prev_ema_20 and current_ema_9 > current_ema_20:
+        if bullish_cross:
             signal = 'BUY'
-        elif prev_ema_9 >= prev_ema_20 and current_ema_9 < current_ema_20:
+            self.last_crossover_time = current_timestamp
+        elif bearish_cross:
             signal = 'SELL'
+            self.last_crossover_time = current_timestamp
         else:
             signal = 'HOLD'
             
@@ -306,9 +354,41 @@ class BinanceEMABot:
                 self.telegram.send_error_notification("Balance Fetch Error", str(e))
             raise
 
+    def get_symbol_info(self) -> Dict:
+        """
+        Get symbol trading info for proper quantity formatting
+        
+        Returns:
+            Dictionary with symbol info
+        """
+        try:
+            info = self.client.get_symbol_info(self.symbol)
+            
+            # Find quantity and price filters
+            quantity_filter = next(f for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
+            price_filter = next(f for f in info['filters'] if f['filterType'] == 'PRICE_FILTER')
+            notional_filter = next(f for f in info['filters'] if f['filterType'] == 'NOTIONAL')
+            
+            return {
+                'quantity_precision': len(quantity_filter['stepSize'].rstrip('0').split('.')[-1]),
+                'price_precision': len(price_filter['tickSize'].rstrip('0').split('.')[-1]),
+                'min_quantity': float(quantity_filter['minQty']),
+                'min_notional': float(notional_filter['minNotional'])
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting symbol info: {e}")
+            # Default values for BTCUSDT
+            return {
+                'quantity_precision': 6,
+                'price_precision': 2,
+                'min_quantity': 0.00001,
+                'min_notional': 10.0
+            }
+
     def place_buy_order(self, usdt_amount: float) -> Optional[Dict]:
         """
-        Place a market buy order using all available USDT
+        Place a market buy order using available USDT
         
         Args:
             usdt_amount: Amount of USDT to spend
@@ -317,18 +397,27 @@ class BinanceEMABot:
             Order result or None if failed
         """
         try:
-            # Get current price to estimate quantity
+            symbol_info = self.get_symbol_info()
+            
+            # Get current price
             ticker = self.client.get_symbol_ticker(symbol=self.symbol)
             current_price = float(ticker['price'])
             
-            # Calculate BTC quantity (with small buffer for fees)
-            btc_quantity = (usdt_amount * 0.999) / current_price
+            # Calculate BTC quantity (reserve some USDT for fees)
+            fee_buffer = 0.001  # 0.1% fee buffer
+            usable_amount = usdt_amount * (1 - fee_buffer)
+            btc_quantity = usable_amount / current_price
             
-            # Round to appropriate precision (Binance BTC precision is usually 6 decimal places)
-            btc_quantity = round(btc_quantity, 6)
+            # Round to proper precision
+            btc_quantity = round(btc_quantity, symbol_info['quantity_precision'])
             
-            if btc_quantity * current_price < 10:  # Minimum order value is usually $10
-                logger.warning(f"Order value too small: ${btc_quantity * current_price:.2f}")
+            # Check minimum requirements
+            if btc_quantity < symbol_info['min_quantity']:
+                logger.warning(f"Quantity too small: {btc_quantity} < {symbol_info['min_quantity']}")
+                return None
+                
+            if btc_quantity * current_price < symbol_info['min_notional']:
+                logger.warning(f"Notional value too small: ${btc_quantity * current_price:.2f}")
                 return None
                 
             order = self.client.order_market_buy(
@@ -355,11 +444,18 @@ class BinanceEMABot:
             logger.error(error_msg)
             if self.telegram:
                 self.telegram.send_error_notification("Buy Order Error", str(e))
+                self.telegram.send_trade_notification(
+                    signal="BUY",
+                    price=0,
+                    amount=usdt_amount,
+                    asset="USDT",
+                    success=False
+                )
             return None
 
     def place_sell_order(self, btc_amount: float) -> Optional[Dict]:
         """
-        Place a market sell order for all available BTC
+        Place a market sell order for available BTC
         
         Args:
             btc_amount: Amount of BTC to sell
@@ -368,15 +464,22 @@ class BinanceEMABot:
             Order result or None if failed
         """
         try:
-            # Round to appropriate precision
-            btc_amount = round(btc_amount, 6)
+            symbol_info = self.get_symbol_info()
             
-            # Get current price for logging
+            # Get current price
             ticker = self.client.get_symbol_ticker(symbol=self.symbol)
             current_price = float(ticker['price'])
             
-            if btc_amount * current_price < 10:  # Minimum order value check
-                logger.warning(f"Order value too small: ${btc_amount * current_price:.2f}")
+            # Round to proper precision
+            btc_amount = round(btc_amount, symbol_info['quantity_precision'])
+            
+            # Check minimum requirements
+            if btc_amount < symbol_info['min_quantity']:
+                logger.warning(f"Quantity too small: {btc_amount} < {symbol_info['min_quantity']}")
+                return None
+                
+            if btc_amount * current_price < symbol_info['min_notional']:
+                logger.warning(f"Notional value too small: ${btc_amount * current_price:.2f}")
                 return None
                 
             order = self.client.order_market_sell(
@@ -403,6 +506,13 @@ class BinanceEMABot:
             logger.error(error_msg)
             if self.telegram:
                 self.telegram.send_error_notification("Sell Order Error", str(e))
+                self.telegram.send_trade_notification(
+                    signal="SELL",
+                    price=0,
+                    amount=btc_amount,
+                    asset="BTC",
+                    success=False
+                )
             return None
 
     def execute_trade(self, signal: str, signal_data: Dict) -> None:
@@ -413,11 +523,22 @@ class BinanceEMABot:
             signal: Trading signal ('BUY', 'SELL', 'HOLD')
             signal_data: Signal metadata
         """
-        logger.info(f"Signal: {signal} | Price: ${signal_data['price']:.2f} | "
-                   f"EMA9: ${signal_data['ema_9']:.2f} | EMA20: ${signal_data['ema_20']:.2f}")
+        logger.info(f"=== SIGNAL ANALYSIS ===")
+        logger.info(f"Signal: {signal}")
+        logger.info(f"Price: ${signal_data['price']:.2f}")
+        logger.info(f"EMA9: ${signal_data['ema_9']:.2f}")
+        logger.info(f"EMA20: ${signal_data['ema_20']:.2f}")
+        logger.info(f"EMA Diff: {signal_data['ema_diff']:.2f}")
+        logger.info(f"Prev EMA Diff: {signal_data['prev_ema_diff']:.2f}")
+        logger.info(f"Last Signal: {self.last_signal}")
+        logger.info(f"=======================")
         
-        if signal == 'HOLD' or signal == self.last_signal:
-            logger.info("No action needed")
+        if signal == 'HOLD':
+            logger.info("No action needed - HOLD signal")
+            return
+            
+        if signal == self.last_signal:
+            logger.info(f"Signal unchanged ({signal}) - no action needed")
             return
             
         # Get current balances
@@ -427,21 +548,31 @@ class BinanceEMABot:
         
         logger.info(f"Current balances - BTC: {btc_balance:.6f}, USDT: ${usdt_balance:.2f}")
         
-        if signal == 'BUY' and usdt_balance > 10:  # Minimum $10 to trade
-            logger.info(f"Executing BUY signal with ${usdt_balance:.2f} USDT")
-            order = self.place_buy_order(usdt_balance)
-            if order:
-                self.position = 'BTC'
-                self.last_signal = signal
+        if signal == 'BUY':
+            if usdt_balance >= self.min_trade_amount:
+                logger.info(f"Executing BUY signal with ${usdt_balance:.2f} USDT")
+                order = self.place_buy_order(usdt_balance)
+                if order:
+                    self.position = 'BTC'
+                    self.last_signal = signal
+                    logger.info("BUY order executed successfully")
+                else:
+                    logger.error("BUY order failed")
+            else:
+                logger.warning(f"Insufficient USDT balance: ${usdt_balance:.2f} < ${self.min_trade_amount:.2f}")
                 
-        elif signal == 'SELL' and btc_balance > 0:
-            logger.info(f"Executing SELL signal with {btc_balance:.6f} BTC")
-            order = self.place_sell_order(btc_balance)
-            if order:
-                self.position = 'USDT'
-                self.last_signal = signal
-        else:
-            logger.info("Insufficient balance to execute trade")
+        elif signal == 'SELL':
+            if btc_balance > 0:
+                logger.info(f"Executing SELL signal with {btc_balance:.6f} BTC")
+                order = self.place_sell_order(btc_balance)
+                if order:
+                    self.position = 'USDT'
+                    self.last_signal = signal
+                    logger.info("SELL order executed successfully")
+                else:
+                    logger.error("SELL order failed")
+            else:
+                logger.warning(f"No BTC balance to sell: {btc_balance:.6f}")
 
     def run_strategy(self) -> None:
         """
@@ -452,6 +583,10 @@ class BinanceEMABot:
             
             # Get historical data
             df = self.get_historical_data()
+            
+            if len(df) < 50:  # Ensure we have enough data
+                logger.warning("Insufficient historical data for EMA calculation")
+                return
             
             # Generate signals
             signal, signal_data = self.generate_signals(df)
@@ -467,19 +602,79 @@ class BinanceEMABot:
             if self.telegram:
                 self.telegram.send_error_notification("Strategy Execution Error", str(e))
 
+    def run_backtest(self, days: int = 30) -> None:
+        """
+        Run a simple backtest to verify strategy logic
+        
+        Args:
+            days: Number of days to backtest
+        """
+        try:
+            logger.info(f"=== Running {days}-day backtest ===")
+            
+            # Get more historical data for backtest
+            df = self.get_historical_data(limit=days * 24)  # 24 hours per day
+            
+            if len(df) < 50:
+                logger.warning("Insufficient data for backtest")
+                return
+            
+            # Calculate EMAs
+            df['ema_9'] = self.calculate_ema_tradingview_style(df['close'], self.ema_short)
+            df['ema_20'] = self.calculate_ema_tradingview_style(df['close'], self.ema_long)
+            
+            # Identify crossovers
+            df['signal'] = 'HOLD'
+            df['prev_ema_9'] = df['ema_9'].shift(1)
+            df['prev_ema_20'] = df['ema_20'].shift(1)
+            
+            # Mark crossovers
+            bullish_mask = (df['prev_ema_9'] <= df['prev_ema_20']) & (df['ema_9'] > df['ema_20'])
+            bearish_mask = (df['prev_ema_9'] >= df['prev_ema_20']) & (df['ema_9'] < df['ema_20'])
+            
+            df.loc[bullish_mask, 'signal'] = 'BUY'
+            df.loc[bearish_mask, 'signal'] = 'SELL'
+            
+            # Count signals
+            buy_signals = len(df[df['signal'] == 'BUY'])
+            sell_signals = len(df[df['signal'] == 'SELL'])
+            
+            logger.info(f"Backtest Results:")
+            logger.info(f"- Buy signals: {buy_signals}")
+            logger.info(f"- Sell signals: {sell_signals}")
+            logger.info(f"- Data points: {len(df)}")
+            logger.info(f"- Latest EMA9: ${df['ema_9'].iloc[-1]:.2f}")
+            logger.info(f"- Latest EMA20: ${df['ema_20'].iloc[-1]:.2f}")
+            logger.info(f"- Latest Price: ${df['close'].iloc[-1]:.2f}")
+            
+            # Show recent signals
+            recent_signals = df[df['signal'] != 'HOLD'].tail(5)
+            if not recent_signals.empty:
+                logger.info("Recent signals:")
+                for _, row in recent_signals.iterrows():
+                    logger.info(f"  {row['timestamp']}: {row['signal']} at ${row['close']:.2f}")
+            
+            logger.info("=== Backtest completed ===\n")
+            
+        except Exception as e:
+            logger.error(f"Error in backtest: {e}")
+
     def start_bot(self) -> None:
         """
         Start the trading bot with hourly execution
         """
         logger.info("Starting Binance EMA Trading Bot...")
         
-        # Run immediately on start
+        # Run backtest first
+        self.run_backtest()
+        
+        # Run strategy immediately on start
         self.run_strategy()
         
-        # Schedule to run every hour
-        schedule.every().hour.at(":01").do(self.run_strategy)  # Run at 1 minute past each hour
+        # Schedule to run every hour at minute 5 (to avoid exact hour timing issues)
+        schedule.every().hour.at(":05").do(self.run_strategy)
         
-        logger.info("Bot scheduled to run every hour. Press Ctrl+C to stop.")
+        logger.info("Bot scheduled to run every hour at minute 5. Press Ctrl+C to stop.")
         
         try:
             while True:
@@ -515,7 +710,7 @@ def main():
         api_secret=API_SECRET,
         telegram_token=TELEGRAM_TOKEN,
         telegram_chat_id=TELEGRAM_CHAT_ID,
-        testnet=False  # Set to False for live trading
+        testnet=True  # IMPORTANT: Set to False only when you're ready for live trading
     )
     
     # Start the bot
