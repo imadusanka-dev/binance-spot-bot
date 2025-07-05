@@ -4,4 +4,4 @@ numpy>=1.21.0
 schedule>=1.2.0
 requests>=2.25.0
 python-dotenv
-TA-Lib
+ta

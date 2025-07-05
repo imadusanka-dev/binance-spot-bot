@@ -10,7 +10,7 @@ import os
 import requests
 from typing import Dict, Tuple, Optional
 from dotenv import load_dotenv
-import talib
+import ta
 
 # Load environment variables from .env file
 load_dotenv()
@@ -231,10 +231,9 @@ class BinanceEMABot:
                 self.telegram.send_error_notification("Data Fetch Error", str(e))
             raise
 
-    def calculate_ema_tradingview_style(self, data: pd.Series, period: int) -> pd.Series:
+    def calculate_ema_ta(self, data: pd.Series, period: int) -> pd.Series:
         """
-        Calculate EMA using TradingView-style calculation
-        This matches TradingView's EMA calculation more closely
+        Calculate EMA using ta library
         
         Args:
             data: Price data series
@@ -244,11 +243,12 @@ class BinanceEMABot:
             EMA series
         """
         try:
-            # Use TA-Lib if available (more accurate)
-            import talib
-            return pd.Series(talib.EMA(data.values, timeperiod=period), index=data.index)
-        except ImportError:
-            # Fallback to pandas with TradingView-style calculation
+            # Use ta library for EMA calculation
+            ema = ta.trend.EMAIndicator(close=data, window=period).ema_indicator()
+            return ema
+        except Exception as e:
+            logger.error(f"Error calculating EMA with ta library: {e}")
+            # Fallback to pandas ewm calculation
             alpha = 2 / (period + 1)
             ema = data.ewm(alpha=alpha, adjust=False).mean()
             return ema
@@ -263,9 +263,9 @@ class BinanceEMABot:
         Returns:
             Tuple of (signal, signal_data)
         """
-        # Calculate EMAs
-        df['ema_9'] = self.calculate_ema_tradingview_style(df['close'], self.ema_short)
-        df['ema_20'] = self.calculate_ema_tradingview_style(df['close'], self.ema_long)
+        # Calculate EMAs using ta library
+        df['ema_9'] = self.calculate_ema_ta(df['close'], self.ema_short)
+        df['ema_20'] = self.calculate_ema_ta(df['close'], self.ema_long)
         
         # Get the latest values (need at least 3 points for crossover detection)
         current_ema_9 = df['ema_9'].iloc[-1]
@@ -619,9 +619,9 @@ class BinanceEMABot:
                 logger.warning("Insufficient data for backtest")
                 return
             
-            # Calculate EMAs
-            df['ema_9'] = self.calculate_ema_tradingview_style(df['close'], self.ema_short)
-            df['ema_20'] = self.calculate_ema_tradingview_style(df['close'], self.ema_long)
+            # Calculate EMAs using ta library
+            df['ema_9'] = self.calculate_ema_ta(df['close'], self.ema_short)
+            df['ema_20'] = self.calculate_ema_ta(df['close'], self.ema_long)
             
             # Identify crossovers
             df['signal'] = 'HOLD'
